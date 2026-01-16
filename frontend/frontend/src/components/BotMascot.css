@@ -1,0 +1,390 @@
+/* Bot Mascot Styles */
+
+.bot-mascot {
+  width: 60px;
+  height: 60px;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.mascot-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  animation: float-mascot 3s infinite ease-in-out;
+}
+
+@keyframes float-mascot {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.bot-mascot.typing .mascot-container {
+  animation: typing-bounce 0.6s infinite ease-in-out;
+}
+
+@keyframes typing-bounce {
+  0%, 100% {
+    transform: translateY(0px) scale(1);
+  }
+  50% {
+    transform: translateY(-4px) scale(1.05);
+  }
+}
+
+/* Glowing Aura */
+.glow-aura {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(74, 222, 128, 0.4) 0%, transparent 70%);
+  animation: pulse-glow 2s infinite ease-in-out;
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.6;
+  }
+  50% {
+    transform: translate(-50%, -50%) scale(1.2);
+    opacity: 1;
+  }
+}
+
+/* Leaf Body */
+.leaf-body {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 50px;
+  height: 60px;
+  background: linear-gradient(135deg, #4ade80 0%, #22c55e 70%, #16a34a 100%);
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+  box-shadow: 
+    0 4px 15px rgba(34, 197, 94, 0.4),
+    inset 0 2px 8px rgba(255, 255, 255, 0.3),
+    inset 0 -2px 8px rgba(0, 0, 0, 0.1);
+  position: relative;
+  overflow: hidden;
+}
+
+/* Leaf Veins */
+.leaf-veins {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.vein {
+  position: absolute;
+  background: linear-gradient(to bottom, 
+    rgba(255, 255, 255, 0.3) 0%, 
+    rgba(255, 255, 255, 0.1) 100%);
+  border-radius: 2px;
+}
+
+.central-vein {
+  width: 2px;
+  height: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.side-vein {
+  height: 1px;
+  width: 40%;
+  top: 50%;
+}
+
+.vein-1 {
+  left: 50%;
+  top: 25%;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+.vein-2 {
+  right: 50%;
+  top: 25%;
+  transform: rotate(-45deg);
+  transform-origin: right center;
+}
+
+.vein-3 {
+  left: 50%;
+  top: 60%;
+  transform: rotate(60deg);
+  transform-origin: left center;
+}
+
+.vein-4 {
+  right: 50%;
+  top: 60%;
+  transform: rotate(-60deg);
+  transform-origin: right center;
+}
+
+/* Circuit Patterns */
+.circuit-patterns {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.circuit-dot {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.8);
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
+  animation: circuit-pulse 2s infinite ease-in-out;
+}
+
+.dot-1 {
+  top: 20%;
+  left: 30%;
+  animation-delay: 0s;
+}
+
+.dot-2 {
+  top: 50%;
+  right: 25%;
+  animation-delay: 0.7s;
+}
+
+.dot-3 {
+  bottom: 25%;
+  left: 35%;
+  animation-delay: 1.4s;
+}
+
+@keyframes circuit-pulse {
+  0%, 100% {
+    opacity: 0.3;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.5);
+  }
+}
+
+.circuit-line {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.3);
+  width: 1px;
+  animation: circuit-flow 3s infinite ease-in-out;
+}
+
+.line-1 {
+  height: 15px;
+  top: 22%;
+  left: 32%;
+  transform: rotate(30deg);
+}
+
+.line-2 {
+  height: 12px;
+  bottom: 27%;
+  left: 37%;
+  transform: rotate(-20deg);
+}
+
+@keyframes circuit-flow {
+  0%, 100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+/* Eyes */
+.eyes {
+  position: absolute;
+  top: 35%;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 12px;
+}
+
+.eye {
+  width: 8px;
+  height: 8px;
+  background: white;
+  border-radius: 50%;
+  position: relative;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+.eye.blink {
+  height: 2px;
+  transform: scaleY(0.2);
+}
+
+.pupil {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 4px;
+  height: 4px;
+  background: #1a4d2e;
+  border-radius: 50%;
+  animation: look-around 5s infinite ease-in-out;
+}
+
+@keyframes look-around {
+  0%, 100% {
+    transform: translate(-50%, -50%);
+  }
+  25% {
+    transform: translate(-70%, -50%);
+  }
+  50% {
+    transform: translate(-50%, -70%);
+  }
+  75% {
+    transform: translate(-30%, -50%);
+  }
+}
+
+.eye-shine {
+  position: absolute;
+  top: 20%;
+  left: 20%;
+  width: 3px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 50%;
+}
+
+/* Smile */
+.smile {
+  position: absolute;
+  bottom: 25%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 16px;
+  height: 8px;
+  border: 2px solid rgba(255, 255, 255, 0.7);
+  border-top: none;
+  border-radius: 0 0 16px 16px;
+}
+
+/* Floating Particles */
+.particles {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.particle {
+  position: absolute;
+  font-size: 12px;
+  opacity: 0;
+  animation: particle-float 4s infinite ease-in-out;
+}
+
+.particle-1 {
+  top: 10%;
+  left: 20%;
+  animation-delay: 0s;
+}
+
+.particle-2 {
+  top: 30%;
+  right: 15%;
+  animation-delay: 1.3s;
+}
+
+.particle-3 {
+  bottom: 20%;
+  left: 25%;
+  animation-delay: 2.6s;
+}
+
+@keyframes particle-float {
+  0% {
+    opacity: 0;
+    transform: translateY(0) scale(0.5);
+  }
+  20% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-30px) scale(1);
+  }
+}
+
+/* Tendrils (roots) */
+.tendrils {
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 60px;
+  height: 15px;
+}
+
+.tendril {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  background: linear-gradient(to bottom, 
+    rgba(22, 163, 74, 0.6) 0%, 
+    transparent 100%);
+  transform-origin: top center;
+  animation: tendril-sway 3s infinite ease-in-out;
+}
+
+.tendril-1 {
+  left: 30%;
+  height: 12px;
+  animation-delay: 0s;
+}
+
+.tendril-2 {
+  left: 50%;
+  height: 10px;
+  animation-delay: 1s;
+}
+
+.tendril-3 {
+  left: 70%;
+  height: 11px;
+  animation-delay: 2s;
+}
+
+@keyframes tendril-sway {
+  0%, 100% {
+    transform: rotate(-5deg);
+  }
+  50% {
+    transform: rotate(5deg);
+  }
+}
