@@ -1,0 +1,179 @@
+/* Cartoon Ambient Background Styles */
+
+.cartoon-ambient-background {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 0;
+}
+
+/* 1. Cartoon Sun in Top-Right Corner */
+.cartoon-sun {
+  position: absolute;
+  top: 24px;
+  right: 48px;
+  width: 90px;
+  height: 90px;
+  filter: drop-shadow(0 6px 20px rgba(250, 204, 21, 0.45));
+  animation: sunFloat 4s infinite ease-in-out;
+}
+
+@keyframes sunFloat {
+  0%, 100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-10px) rotate(4deg);
+  }
+}
+
+.sun-rays {
+  transform-origin: 50px 50px;
+  animation: spinRays 24s infinite linear;
+}
+
+@keyframes spinRays {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 2. Parachute Spud Drifting across top-left */
+.floating-chute-spud {
+  position: absolute;
+  top: 60px;
+  left: 36px;
+  width: 75px;
+  height: 110px;
+  animation: chuteDrift 9s infinite ease-in-out;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.25));
+}
+
+@keyframes chuteDrift {
+  0%, 100% {
+    transform: translate(0, 0) rotate(-6deg);
+  }
+  50% {
+    transform: translate(25px, -30px) rotate(8deg);
+  }
+}
+
+/* 3. Chugging Cartoon Tractor along bottom */
+.cartoon-tractor-wrapper {
+  position: absolute;
+  bottom: 14px;
+  left: -140px;
+  width: 120px;
+  height: 70px;
+  animation: tractorDrive 28s infinite linear;
+  filter: drop-shadow(0 6px 12px rgba(0, 0, 0, 0.3));
+}
+
+@keyframes tractorDrive {
+  0% {
+    left: -140px;
+    transform: scaleX(-1);
+  }
+  48% {
+    left: calc(100% + 20px);
+    transform: scaleX(-1);
+  }
+  50% {
+    left: calc(100% + 20px);
+    transform: scaleX(1);
+  }
+  98% {
+    left: -140px;
+    transform: scaleX(1);
+  }
+  100% {
+    left: -140px;
+    transform: scaleX(-1);
+  }
+}
+
+.tractor-svg {
+  animation: tractorRumble 0.3s infinite alternate ease-in-out;
+}
+
+@keyframes tractorRumble {
+  0% {
+    transform: translateY(0);
+  }
+  100% {
+    transform: translateY(-2.5px);
+  }
+}
+
+/* Rolling Wheels */
+.tractor-wheel-front {
+  transform-origin: 34px 54px;
+  animation: wheelRoll 0.6s infinite linear;
+}
+
+.tractor-wheel-back {
+  transform-origin: 82px 50px;
+  animation: wheelRoll 0.9s infinite linear;
+}
+
+@keyframes wheelRoll {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Smoke Puffs from Tractor */
+.smoke-1 {
+  animation: puffSmoke 0.6s infinite ease-out;
+  transform-origin: 36px 8px;
+}
+
+.smoke-2 {
+  animation: puffSmoke 0.6s infinite ease-out 0.3s;
+  transform-origin: 33px 2px;
+}
+
+@keyframes puffSmoke {
+  0% {
+    transform: scale(0.6) translateY(0);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.2) translateY(-14px) translateX(-6px);
+    opacity: 0;
+  }
+}
+
+/* 4. Peekaboo Worm in Bottom-Right Corner */
+.peekaboo-worm {
+  position: absolute;
+  bottom: 20px;
+  right: 28px;
+  width: 50px;
+  height: 60px;
+  animation: wormPeek 6s infinite ease-in-out;
+  filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.2));
+}
+
+@keyframes wormPeek {
+  0%, 15%, 85%, 100% {
+    transform: translateY(30px);
+    opacity: 0;
+  }
+  25%, 75% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  45% {
+    transform: translateY(-6px) rotate(-6deg);
+  }
+  55% {
+    transform: translateY(-6px) rotate(6deg);
+  }
+}

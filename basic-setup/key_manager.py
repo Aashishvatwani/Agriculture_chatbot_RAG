@@ -1,101 +1,91 @@
 import os
-import queue
+import requests
 from dotenv import load_dotenv
-import google.generativeai as genai
-from threading import Lock
 
 load_dotenv()
 
-class GeminiKeyManager:
-    def __init__(self, key_list=None):
-        """
-        Initialize the key manager with a list of API keys.
-        If minimal keys are provided, it tries to load 'GOOGLE_API_KEY' from env as a fallback/starter.
-        """
-        self.key_queue = queue.Queue()
-        self.lock = Lock()
-        self.current_key = None
-        
-        # Load keys from argument or environment
-        if key_list:
-            for key in key_list:
-                self.key_queue.put(key.strip())
-        else:
-            # Fallback: try to load multiple keys from env var, comma-separated
-            env_keys = os.getenv("GOOGLE_API_KEYS_POOL")  # e.g. "KEY1,KEY2,KEY3"
-            if env_keys:
-                for key in env_keys.split(','):
-                    if key.strip():
-                        self.key_queue.put(key.strip())
-            
-            # Also try the standard single key if pool is empty
-            if self.key_queue.empty():
-                single_key = os.getenv("GOOGLE_API_KEY")
-                if single_key:
-                    self.key_queue.put(single_key)
-        
-        # Initialize the first key
-        self._rotate_key()
 
-    def _rotate_key(self):
-        """Get the next key from the queue and set it as active."""
-        with self.lock:
-            if self.key_queue.empty():
-                if self.current_key:
-                     print("Warning: No more fresh keys in queue. Retrying with current key.")
-                     return False
-                else:
-                    raise ValueError("No API keys available in the pool.")
-            
-            # If we had a key, put it back at the end of the queue (round-robin)
-            # OR discard it if you want to perform strictly "expire and burn". 
-            # Here we implement round-robin assuming quota limits might reset.
-            # If you want to permanently discard invalid keys, remove this line:
-            if self.current_key:
-                self.key_queue.put(self.current_key)
-            
-            self.current_key = self.key_queue.get()
-            print(f"Switched to API Key ending in ...{self.current_key[-4:]}")
-            
-            # Re-configure global genai with new key
-            genai.configure(api_key=self.current_key)
-            return True
+class OpenRouterKeyManager:
+    """Simple manager for OpenRouter API key and model configuration."""
 
-    def get_valid_model(self, model_name='gemini-1.5-flash'):
+    def __init__(self, api_key: str = None):
         """
-        Returns a configured GenerativeModel. 
-        Wrap your generate calls with retry/rotation logic using execute_with_retry().
-        """
-        return genai.GenerativeModel(model_name)
+        Initialize the key manager.
 
-    def execute_with_retry(self, func, *args, **kwargs):
-        """
-        Executes a function (like model.generate_content) and handles key expiration/quota errors by rotating keys.
-        
         Args:
-            func: The callable function (e.g., model.generate_content)
-            *args, **kwargs: Arguments to pass to the function
-            
-        Returns:
-            The result of the function call.
+            api_key: OpenRouter API key. If not provided, reads from
+                     OPENROUTER_API_KEY environment variable.
         """
-        max_retries = self.key_queue.qsize() + 1
-        attempts = 0
-        
-        while attempts < max_retries:
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "No OpenRouter API key provided. Set OPENROUTER_API_KEY in "
+                "your .env file or pass it directly."
+            )
+        self.api_base = "https://openrouter.ai/api/v1"
+        print(f"OpenRouter key configured (ending ...{self.api_key[-4:]})")
+
+    def get_headers(self, referer: str = "http://localhost:8000", title: str = "AgriSearch Bot") -> dict:
+        """Return standard headers for OpenRouter API requests."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": referer,
+            "X-Title": title,
+        }
+
+    def chat_completion(self, messages: list, model: str = None, **kwargs) -> dict:
+        """
+        Send a chat completion request to OpenRouter.
+
+        Args:
+            messages: List of message dicts (role/content).
+            model: Model identifier. Defaults to OPENROUTER_MODEL env var or
+                   qwen/qwen3.8-27b:free.
+            **kwargs: Extra body parameters (temperature, max_tokens, etc.)
+
+        Returns:
+            The JSON response from OpenRouter.
+        """
+        model = model or os.getenv("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            **kwargs,
+        }
+
+        response = requests.post(
+            f"{self.api_base}/chat/completions",
+            headers=self.get_headers(),
+            json=payload,
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def execute_with_retry(self, func, *args, max_retries: int = 3, **kwargs):
+        """
+        Execute a function with simple retry logic for transient errors.
+
+        Args:
+            func: Callable to execute.
+            max_retries: Number of retries on transient failures.
+
+        Returns:
+            The result of func(*args, **kwargs).
+        """
+        last_error = None
+        for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
+                last_error = e
                 error_str = str(e).lower()
-                # Check for common quota/auth errors
-                if "429" in error_str or "quota" in error_str or "key" in error_str or "permission" in error_str:
-                    print(f"Key error encountered: {e}. Rotating key...")
-                    if not self._rotate_key():
-                        # If rotation fails (no keys left to switch to), re-raise
-                        raise e
-                    attempts += 1
+                # Retry on rate-limit or server errors
+                if "429" in error_str or "500" in error_str or "502" in error_str or "503" in error_str:
+                    print(f"Transient error (attempt {attempt + 1}/{max_retries}): {e}")
+                    continue
                 else:
-                    # If it's a different error (e.g. invalid input), don't verify key, just raise
-                    raise e
-        
-        raise RuntimeError("All API keys in pool exhausted or failed.")
+                    raise
+        raise RuntimeError(f"All {max_retries} retry attempts failed. Last error: {last_error}")

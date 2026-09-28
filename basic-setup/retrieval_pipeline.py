@@ -1,658 +1,655 @@
 import os
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import ChatOllama
-from dotenv import load_dotenv
 import re
 import json
 import csv
 from pathlib import Path
-import difflib
+from collections import OrderedDict
+from typing import Optional, Tuple, List, Dict, Any
+
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+
 try:
     from rank_bm25 import BM25Okapi
-except Exception:
+except ImportError:
     BM25Okapi = None
 
 load_dotenv()
 
+
 class AgriRAGSystem:
-    def __init__(self, persist_directory="chroma_db"):
-        """Initialize the Agriculture RAG system with Ollama"""
+    """
+    Optimized Agriculture RAG System:
+    - In-memory O(1) QA index & BM25 sparse index (instant response for thousands of common questions)
+    - Single-pass dense vector search with Chroma (eliminates redundant embeddings)
+    - Fixed cosine distance confidence metric (properly identifies exact & high-similarity matches)
+    - Hybrid retrieval: BM25 keyword matching + Dense vector search
+    - LRU query cache with normalized keys (avoids re-running identical or near-identical queries)
+    - Clean source citation formatting
+    - Graceful error handling for OpenRouter API rate limits
+    """
+
+    def __init__(self, persist_directory: str = "chroma_db"):
         self.persist_directory = persist_directory
-        
-        # Initialize embeddings with free local model
+
+        # 1. Initialize local embeddings
         self.embedding_model = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
         )
-        
-        # Load vector store
+
+        # 2. Load vector store
         self.db = Chroma(
             persist_directory=self.persist_directory,
             embedding_function=self.embedding_model,
-            collection_metadata={"hnsw:space": "cosine"}
-        )
-        
-        # Initialize Ollama model
-        self.llm = ChatOllama(
-            model="llama3.1",
-            temperature=0.3
-        )
-        
-        # Create retriever
-        self.retriever = self.db.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 3}
+            collection_metadata={"hnsw:space": "cosine"},
         )
 
-        # Simple in-memory cache to avoid repeated LLM calls for same queries
-        self._cache = {}
-        # Maximum characters to include from each context document when building prompt
+        # 3. Initialize OpenRouter configuration with multi-model failover
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.primary_model = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
+        fallback_str = os.getenv(
+            "OPENROUTER_FALLBACK_MODELS",
+            "nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3.5-lightning:free",
+        )
+        fallbacks = [m.strip() for m in fallback_str.split(",") if m.strip()]
+        self.models_pool = list(dict.fromkeys([self.primary_model] + fallbacks))
+
+        if not self.openrouter_api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY not found in environment variables. "
+                "Please set it in your .env file."
+            )
+
+        print(f"OpenRouter Model Pool: {self.models_pool}")
+
+        # 4. In-memory LRU cache (capped at 500 entries)
+        self._cache = OrderedDict()
+        self._max_cache_size = 500
         self._max_ctx_chars = 1000
 
-        # Build BM25 index over local CSV questions for misspell correction / fuzzy retrieval
-        self.bm25 = None
-        self.bm25_qtexts = []
-        self.bm25_rows = []
-        if BM25Okapi is not None:
+        # 5. Build in-memory QA map and BM25 index from files/
+        self._exact_qa: Dict[str, Dict[str, str]] = {}
+        self.bm25: Optional[BM25Okapi] = None
+        self.bm25_records: List[Dict[str, str]] = []
+        self._build_in_memory_indexes()
+
+    @staticmethod
+    def _normalize_key(text: str) -> str:
+        """Strip punctuation and lowercase for normalized cache/lookup keys."""
+        return re.sub(r"[^\w\s]", "", text.strip().lower())
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """Simple, fast tokenizer for BM25 keyword matching."""
+        return [w for w in re.findall(r"\b\w+\b", text.lower()) if len(w) > 1]
+
+    def _build_in_memory_indexes(self):
+        """
+        Loads all CSV QA pairs into memory ONCE at startup:
+        - self._exact_qa: normalized_question -> {question, answer, source} for O(1) lookup
+        - self.bm25: BM25Okapi index for sub-millisecond typo-tolerant keyword search
+        This completely eliminates opening/scanning CSV files on disk during queries.
+        """
+        base = Path(__file__).resolve().parent / "files"
+        if not base.exists():
+            return
+
+        corpus = []
+        count = 0
+
+        for fp in base.rglob("*.csv"):
             try:
-                self.build_bm25_index()
+                with open(fp, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        # Support multiple CSV column conventions
+                        q = (
+                            row.get("question")
+                            or row.get("Question")
+                            or row.get("Question Text")
+                            or row.get("Term")
+                            or ""
+                        ).strip()
+                        a = (
+                            row.get("answer")
+                            or row.get("Answer")
+                            or row.get("answer_text")
+                            or row.get("response")
+                            or row.get("Definition")
+                            or ""
+                        ).strip()
+
+                        if q and a:
+                            clean_source = fp.name
+                            record = {
+                                "question": q,
+                                "answer": a,
+                                "source": clean_source,
+                            }
+                            # Store exact normalized question
+                            norm_q = self._normalize_key(q)
+                            self._exact_qa[norm_q] = record
+
+                            # Also add alias for definition terms (e.g. "what is soil" -> Soil)
+                            if row.get("Term") and not norm_q.startswith("what is"):
+                                self._exact_qa[f"what is {norm_q}"] = record
+
+                            tokens = self._tokenize(q)
+                            if tokens:
+                                corpus.append(tokens)
+                                self.bm25_records.append(record)
+                                count += 1
             except Exception as e:
-                print(f"BM25 index build failed: {e}")
-    
+                print(f"Warning: could not index {fp.name}: {e}")
+
+        if BM25Okapi is not None and corpus:
+            try:
+                self.bm25 = BM25Okapi(corpus)
+                print(f"Indexed {count} agricultural QA records into memory with BM25.")
+            except Exception as e:
+                print(f"BM25 build error: {e}")
+
     def is_agriculture_related(self, query: str) -> bool:
-        """Check if query is agriculture/crop related"""
+        """Check if query is agriculture/crop related."""
         agri_keywords = [
-            # general agriculture terms
-            'agri', 'agriculture', 'agricultural', 'farm', 'farmer', 'farming', 'cultivation',
-            'cropping', 'crop', 'harvest', 'yield', 'produce', 'produce market', 'agribusiness',
-            # crops (common)
-            'wheat', 'rice', 'paddy', 'maize', 'corn', 'millet', 'sorghum', 'barley', 'oats',
-            'sugarcane', 'cotton', 'soybean', 'groundnut', 'peanut', 'pulses', 'lentil', 'chickpea',
-            'mustard', 'rapeseed', 'canola', 'potato', 'tomato', 'onion', 'garlic', 'banana',
-            'mango', 'citrus', 'tea', 'coffee', 'cocoa', 'pepper',
-            # soil and nutrients
-            'soil', 'soil test', 'ph', 'ec', 'electrical conductivity', 'organic matter',
-            'nitrogen', 'phosphorus', 'potassium', 'npk', 'micronutrient', 'calcium', 'magnesium',
-            'soil type', 'clay', 'sandy', 'loam', 'peat', 'silt', 'moisture',
-            # fertilizers & amendments
-            'fertilizer', 'manure', 'compost', 'biofertilizer', 'lime', 'gypsum', 'urea', 'dap',
-            # pesticides & pest management
-            'pesticide', 'herbicide', 'insecticide', 'fungicide', 'rodenticide',
-            'pest', 'pests', 'aphid', 'borer', 'weevil', 'locust', 'whitefly', 'thrips', 'mealybug',
-            'nematode', 'armyworm', 'leaf miner',
-            # diseases
-            'disease', 'blight', 'rust', 'blast', 'wilt', 'mosaic', 'scab', 'smut', 'root rot',
-            # irrigation & water
-            'irrigation', 'drip', 'drip irrigation', 'sprinkler', 'flood irrigation', 'canal',
-            'water management', 'water table', 'groundwater', 'rainfall', 'drought', 'moisture stress',
-            # weather & climate
-            'weather', 'climate', 'temperature', 'forecast', 'monsoon', 'frost', 'hail', 'humidity',
-            'wind', 'season', 'growing season',
-            # practices & techniques
-            'sowing', 'seeding', 'planting', 'transplanting', 'pruning', 'grafting', 'mulching',
-            'crop rotation', 'intercropping', 'agroforestry', 'greenhouse', 'polyhouse', 'hydroponics',
-            'aquaponics', 'organic farming', 'precision farming', 'conservation agriculture',
-            # machinery & tools
-            'tractor', 'plough', 'plow', 'tiller', 'harvester', 'combine', 'seed drill', 'sprayer',
-            # labor, economics & finance
-            'labor', 'labour', 'wage', 'wages', 'salary', 'employment', 'migrant worker',
-            'credit', 'loan', 'finance', 'subsidy', 'microcredit', 'insurance', 'crop insurance',
-            'market', 'mandi', 'minimum support price', 'msp', 'price', 'exports', 'imports',
-            # measurement units & scales
-            'hectare', 'acre', 'kg', 'kilogram', 'tonne', 'ton', 'quintal', 'acreage', 'yield per hectare',
-            # institutions & extension
-            'extension', 'agriculture extension', 'cooperative', 'farmer producer organization', 'fpo',
-            'research station', 'krishi', 'kisan', 'agri department', 'agri ministry',
-            # resources & sustainability
-            'soil health', 'soil testing', 'sustainable', 'organic', 'biodiversity', 'carbon sequestration',
-            'fertility', 'nutrient management',
-            # common phrases and misc
-            'seed', 'variety', 'hybrid', 'indigenous', 'germination', 'seedling', 'nursery',
-            'postharvest', 'storage', 'grading', 'sorting', 'processing', 'supply chain',
-            'export', 'import', 'market access'
+            "agri", "agriculture", "agricultural", "farm", "farmer", "farming", "cultivation",
+            "cropping", "crop", "harvest", "yield", "produce", "produce market", "agribusiness",
+            "wheat", "rice", "paddy", "maize", "corn", "millet", "sorghum", "barley", "oats",
+            "sugarcane", "cotton", "soybean", "groundnut", "peanut", "pulses", "lentil", "chickpea",
+            "mustard", "rapeseed", "canola", "potato", "tomato", "onion", "garlic", "banana",
+            "mango", "citrus", "tea", "coffee", "cocoa", "pepper",
+            "soil", "soil test", "ph", "ec", "electrical conductivity", "organic matter",
+            "nitrogen", "phosphorus", "potassium", "npk", "micronutrient", "calcium", "magnesium",
+            "soil type", "clay", "sandy", "loam", "peat", "silt", "moisture",
+            "fertilizer", "manure", "compost", "biofertilizer", "lime", "gypsum", "urea", "dap",
+            "pesticide", "herbicide", "insecticide", "fungicide", "rodenticide",
+            "pest", "pests", "aphid", "borer", "weevil", "locust", "whitefly", "thrips", "mealybug",
+            "nematode", "armyworm", "leaf miner",
+            "disease", "blight", "rust", "blast", "wilt", "mosaic", "scab", "smut", "root rot",
+            "irrigation", "drip", "drip irrigation", "sprinkler", "flood irrigation", "canal",
+            "water management", "water table", "groundwater", "rainfall", "drought", "moisture stress",
+            "weather", "climate", "temperature", "forecast", "monsoon", "frost", "hail", "humidity",
+            "wind", "season", "growing season",
+            "sowing", "seeding", "planting", "transplanting", "pruning", "grafting", "mulching",
+            "crop rotation", "intercropping", "agroforestry", "greenhouse", "polyhouse", "hydroponics",
+            "aquaponics", "organic farming", "precision farming", "conservation agriculture",
+            "tractor", "plough", "plow", "tiller", "harvester", "combine", "seed drill", "sprayer",
+            "labor", "labour", "wage", "wages", "salary", "employment", "migrant worker",
+            "credit", "loan", "finance", "subsidy", "microcredit", "insurance", "crop insurance",
+            "market", "mandi", "minimum support price", "msp", "price", "exports", "imports",
+            "hectare", "acre", "kg", "kilogram", "tonne", "ton", "quintal", "acreage", "yield per hectare",
+            "extension", "agriculture extension", "cooperative", "fpo", "krishi", "kisan",
+            "soil health", "soil testing", "sustainable", "organic", "biodiversity",
+            "seed", "variety", "hybrid", "germination", "seedling", "nursery",
+            "postharvest", "storage", "grading", "sorting", "processing", "supply chain",
         ]
-        
         query_lower = query.lower()
         return any(keyword in query_lower for keyword in agri_keywords)
-    
+
     def classify_query_type(self, query: str) -> str:
-        """Classify the type of agricultural query"""
+        """Classify the type of agricultural query."""
         query_lower = query.lower()
-        
-        if any(word in query_lower for word in ['disease', 'pest', 'infection', 'damage']):
-            return 'disease'
-        elif any(word in query_lower for word in ['soil', 'nutrient', 'ph', 'fertilizer']):
-            return 'soil'
-        elif any(word in query_lower for word in ['weather', 'rain', 'temperature', 'climate']):
-            return 'weather'
-        elif any(word in query_lower for word in ['wage', 'labor', 'worker', 'salary']):
-            return 'wages'
-        elif any(word in query_lower for word in ['credit', 'loan', 'finance', 'subsidy']):
-            return 'credit'
-        elif any(word in query_lower for word in ['fertilizer', 'npk', 'nutrient']):
-            return 'fertilizer'
+        if any(w in query_lower for w in ["disease", "pest", "infection", "damage", "blight", "rust"]):
+            return "disease"
+        elif any(w in query_lower for w in ["soil", "ph", "nutrient", "clay", "sandy", "loam"]):
+            return "soil"
+        elif any(w in query_lower for w in ["fertilizer", "npk", "urea", "dap", "manure", "compost"]):
+            return "fertilizer"
+        elif any(w in query_lower for w in ["weather", "rain", "temperature", "climate", "monsoon"]):
+            return "weather"
+        elif any(w in query_lower for w in ["wage", "labor", "worker", "salary"]):
+            return "wages"
+        elif any(w in query_lower for w in ["credit", "loan", "finance", "subsidy", "msp", "insurance"]):
+            return "credit"
         else:
-            return 'general'
-    
-    def retrieve_context(self, query: str):
-        """Retrieve relevant documents from vector store"""
-        try:
-            # Prefer the lightweight document retrieval method if available
-            if hasattr(self.retriever, 'get_relevant_documents'):
-                return self.retriever.get_relevant_documents(query)
+            return "general"
 
-            # Fallback to any generic invoke call
-            if hasattr(self.retriever, 'invoke'):
-                return self.retriever.invoke(query)
-
-            return []
-        except Exception as e:
-            print(f"Retrieval error: {e}")
-            return []
-
-    def find_direct_answer(self, query: str, k: int = 3):
-        """Try to find a direct answer from the vector DB via similarity search.
-
-        Returns a tuple (answer_text, sources) or (None, None) if no confident
-        match is found.
+    def fast_lookup(self, query: str) -> Tuple[Optional[str], Optional[List[Dict[str, str]]]]:
         """
-        try:
-            # Use Chroma's similarity search with score if available
-            if hasattr(self.db, 'similarity_search_with_score'):
-                results = self.db.similarity_search_with_score(query, k=k)
-                if not results:
-                    return None, None
-
-                # results is a list of (Document, score)
-                best_doc, best_score = results[0]
-
-                # Heuristic: detect whether score is cosine similarity (in -1..1)
-                # or a distance (lower is better). We support both:
-                if isinstance(best_score, float):
-                    # If score looks like cosine similarity (<=1.0)
-                    if -1.0 <= best_score <= 1.0:
-                        is_confident = best_score >= 0.65
-                    else:
-                        # treat as distance; lower is better
-                        is_confident = best_score <= 0.5
-                else:
-                    is_confident = False
-
-                # If top match is confident and carries an 'answer' in metadata,
-                # return it directly.
-                if is_confident and best_doc and isinstance(best_doc.metadata, dict):
-                    answer = best_doc.metadata.get('answer') or best_doc.metadata.get('Answer')
-                    if answer:
-                        sources = [{
-                            'source': best_doc.metadata.get('source', 'Unknown'),
-                            'excerpt': best_doc.page_content[:200] + ('...' if len(best_doc.page_content) > 200 else '')
-                        }]
-                        return answer, sources
-                    # If metadata does not contain the answer, try to read the source
-                    # CSV (if available) and find a matching question row with an answer.
-                    src = best_doc.metadata.get('source') if isinstance(best_doc.metadata, dict) else None
-                    if src and isinstance(src, str) and os.path.exists(src) and src.lower().endswith('.csv'):
-                        try:
-                            with open(src, newline='', encoding='utf-8') as f:
-                                reader = csv.DictReader(f)
-                                for row in reader:
-                                    # match by question text (best-effort)
-                                    qtext = (row.get('question') or row.get('Question') or row.get('Question Text') or '').strip()
-                                    if not qtext:
-                                        continue
-                                    if qtext.lower() == best_doc.page_content.strip().lower() or qtext.lower() == query.strip().lower():
-                                        ans = row.get('answer') or row.get('Answer') or row.get('answer_text') or row.get('response')
-                                        if ans:
-                                            sources = [{
-                                                'source': src,
-                                                'excerpt': best_doc.page_content[:200] + ('...' if len(best_doc.page_content) > 200 else '')
-                                            }]
-                                            return ans, sources
-                        except Exception as e:
-                            # ignore file read errors and continue
-                            print(f"Error reading source CSV for answer lookup: {e}")
-
-            # Fallback: use the retriever to get documents and inspect metadata
-            docs = self.retriever.get_relevant_documents(query) if hasattr(self.retriever, 'get_relevant_documents') else None
-            if docs:
-                for doc in docs[:k]:
-                    ans = doc.metadata.get('answer') if isinstance(doc.metadata, dict) else None
-                    if ans:
-                        # no score available here; use fuzzy ratio between query and doc text
-                        try:
-                            ratio = difflib.SequenceMatcher(None, query.lower(), doc.page_content.lower()).ratio()
-                        except Exception:
-                            ratio = 0.0
-                        # threshold 0.65 is a conservative fuzzy match for short QA
-                        if ratio >= 0.65:
-                            sources = [{
-                                'source': doc.metadata.get('source', 'Unknown'),
-                                'excerpt': doc.page_content[:200] + ('...' if len(doc.page_content) > 200 else '')
-                            }]
-                            return ans, sources
-
-        except Exception as e:
-            print(f"Direct-answer search error: {e}")
-
-        return None, None
-
-    def csv_lookup_answer(self, query: str):
-        """Scan local CSV files under `files/` for an exact question match and return its answer.
-
+        Fast in-memory lookup (< 1ms):
+        1. Exact match in pre-indexed dictionary
+        2. High-confidence BM25 keyword match for typo-tolerant matching
         Returns (answer, sources) or (None, None).
         """
-        try:
-            base = Path(__file__).resolve().parent / 'files'
-            if not base.exists():
-                return None, None
+        norm_q = self._normalize_key(query)
 
-            qnorm = query.strip().lower()
-            # Try BM25 first (good for misspellings and term variants)
-            if self.bm25 is not None:
-                try:
-                    bm_ans = self.bm25_lookup(query)
-                    if bm_ans:
-                        return bm_ans
-                except Exception:
-                    pass
-            best_match = None
-            best_ratio = 0.0
-            best_source = None
-            FUZZY_THRESHOLD = 0.72
-            for fp in base.rglob('*.csv'):
-                try:
-                    with open(fp, newline='', encoding='utf-8') as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            qtext = (row.get('question') or row.get('Question') or row.get('Question Text') or '').strip()
-                            if not qtext:
-                                continue
-                            if qtext.lower() == qnorm:
-                                ans = row.get('answer') or row.get('Answer') or row.get('answer_text') or row.get('response')
-                                if ans and str(ans).strip():
-                                    sources = [{
-                                        'source': str(fp),
-                                        'excerpt': qtext[:200] + ('...' if len(qtext) > 200 else '')
-                                    }]
-                                    return ans, sources
-                            # track fuzzy best candidate
-                            try:
-                                ratio = difflib.SequenceMatcher(None, qnorm, qtext.lower()).ratio()
-                                if ratio > best_ratio:
-                                    best_ratio = ratio
-                                    best_match = (row, qtext)
-                                    best_source = fp
-                            except Exception:
-                                pass
-                except Exception:
-                    # ignore malformed CSVs and continue
-                    continue
-            # If no exact match, consider the best fuzzy candidate
-            if best_match and best_ratio >= FUZZY_THRESHOLD:
-                row, qtext = best_match
-                ans = row.get('answer') or row.get('Answer') or row.get('answer_text') or row.get('response')
-                if ans and str(ans).strip():
+        # 1. Exact match
+        if norm_q in self._exact_qa:
+            match = self._exact_qa[norm_q]
+            sources = [{
+                "source": match["source"],
+                "excerpt": f"Q: {match['question'][:180]}"
+            }]
+            return match["answer"], sources
+
+        # 2. BM25 keyword matching
+        if self.bm25 is not None and len(self.bm25_records) > 0:
+            tokens = self._tokenize(query)
+            if len(tokens) >= 2:
+                scores = self.bm25.get_scores(tokens)
+                best_idx = int(scores.argmax())
+                best_score = scores[best_idx]
+                # A score >= 7.0 indicates a strong keyword alignment
+                if best_score >= 7.0:
+                    best_match = self.bm25_records[best_idx]
                     sources = [{
-                        'source': str(best_source),
-                        'excerpt': qtext[:200] + ('...' if len(qtext) > 200 else '')
+                        "source": best_match["source"],
+                        "excerpt": f"Q: {best_match['question'][:180]}"
                     }]
-                    return ans, sources
-        except Exception as e:
-            print(f"CSV lookup error: {e}")
+                    return best_match["answer"], sources
 
         return None, None
-    
-    def format_rich_content(self, response: str, query_type: str, context_docs: list):
-        """Format response with rich content based on query type"""
-        rich_content = None
-        
-        if query_type == 'wages' and context_docs:
-            # Try to extract wage data
+
+    def vector_search(self, query: str, k: int = 3) -> List[Tuple[Any, float]]:
+        """
+        Single-pass similarity search returning list of (Document, cosine_distance).
+        Cosine distance: 0.0 = identical, 1.0 = orthogonal.
+        """
+        try:
+            return self.db.similarity_search_with_score(query, k=k)
+        except Exception as e:
+            print(f"Vector search error: {e}")
+            return []
+
+    def check_direct_answer(
+        self, search_results: List[Tuple[Any, float]], threshold_dist: float = 0.35
+    ) -> Tuple[Optional[str], Optional[List[Dict[str, str]]]]:
+        """
+        Extract direct answer if the top vector match is highly confident.
+        Fixed bug: Cosine distance <= 0.35 indicates high confidence (>= 0.65 similarity).
+        """
+        if not search_results:
+            return None, None
+
+        best_doc, best_dist = search_results[0]
+
+        # In cosine distance: 0.0 is perfect, <= 0.35 is confident
+        is_confident = (best_dist <= threshold_dist)
+
+        if is_confident and isinstance(best_doc.metadata, dict):
+            answer = (
+                best_doc.metadata.get("answer")
+                or best_doc.metadata.get("Answer")
+                or best_doc.metadata.get("Definition")
+            )
+            if answer:
+                clean_src = Path(best_doc.metadata.get("source", "Unknown")).name
+                sources = [{
+                    "source": clean_src,
+                    "excerpt": best_doc.page_content[:200] + ("..." if len(best_doc.page_content) > 200 else "")
+                }]
+                return answer, sources
+
+        return None, None
+
+    def format_rich_content(self, response: str, query_type: str, context_docs: list) -> Optional[dict]:
+        """Format response with rich content cards based on query type."""
+        if query_type == "wages" and context_docs:
+            return {
+                "type": "wages-card",
+                "data": {
+                    "category": "Agricultural Wages & Labor",
+                    "info": "Data from census and wage surveys",
+                    "sources": len(context_docs),
+                },
+            }
+        elif query_type == "credit" and context_docs:
+            return {
+                "type": "credit-card",
+                "data": {
+                    "category": "Agriculture Credit & Schemes",
+                    "info": "Government assistance and financial data",
+                    "sources": len(context_docs),
+                },
+            }
+        elif query_type == "soil":
+            return {
+                "type": "soil-card",
+                "data": {
+                    "pH": "Ideal: 6.0 - 7.5 (crop dependent)",
+                    "nitrogen": "Check soil test report",
+                    "phosphorus": "Balanced application recommended",
+                    "potassium": "Essential for disease resistance",
+                    "recommendation": "Soil testing every 2-3 years is recommended",
+                },
+            }
+        elif query_type == "weather":
+            return {
+                "type": "weather-card",
+                "data": {
+                    "temperature": "Check local forecast",
+                    "humidity": "Variable by season",
+                    "rainfall": "Seasonal monitoring advised",
+                    "recommendation": "Adjust irrigation schedule based on precipitation",
+                },
+            }
+        return None
+
+    def generate_with_fallback(self, prompt: str) -> str:
+        """
+        Attempts to generate response with the primary model.
+        If rate-limited (429) or busy, seamlessly falls over to backup free models in the pool.
+        """
+        for model_name in self.models_pool:
             try:
-                # Parse wage information from context
-                rich_content = {
-                    'type': 'wages-card',
-                    'data': {
-                        'category': 'Agricultural Wages',
-                        'info': 'Data from census and wage surveys',
-                        'sources': len(context_docs)
-                    }
-                }
-            except:
-                pass
-        
-        elif query_type == 'credit' and context_docs:
-            rich_content = {
-                'type': 'credit-card',
-                'data': {
-                    'category': 'Agriculture Credit Flow',
-                    'info': 'Financial assistance data',
-                    'sources': len(context_docs)
-                }
-            }
-        
-        elif query_type == 'soil':
-            rich_content = {
-                'type': 'soil-card',
-                'data': {
-                    'pH': 'Varies by region',
-                    'nitrogen': 'Consult local data',
-                    'phosphorus': 'Consult local data',
-                    'potassium': 'Consult local data',
-                    'recommendation': 'Soil testing recommended'
-                }
-            }
-        
-        elif query_type == 'weather':
-            rich_content = {
-                'type': 'weather-card',
-                'data': {
-                    'temperature': 'Check local forecast',
-                    'humidity': 'Variable',
-                    'rainfall': 'Seasonal',
-                    'recommendation': 'Monitor weather patterns'
-                }
-            }
-        
-        return rich_content
-    
+                llm = ChatOpenAI(
+                    model=model_name,
+                    openai_api_key=self.openrouter_api_key,
+                    openai_api_base="https://openrouter.ai/api/v1",
+                    temperature=0.3,
+                    max_tokens=1024,
+                    default_headers={
+                        "HTTP-Referer": "http://localhost:8000",
+                        "X-Title": "AgriSearch Bot",
+                    },
+                )
+                res = llm.invoke(prompt)
+                text = getattr(res, "content", None) or str(res)
+                if text and text.strip():
+                    return text.strip()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str or "temporarily" in err_str:
+                    print(f"Model {model_name} is rate-limited (429). Falling over to next model...")
+                    continue
+                else:
+                    print(f"Model {model_name} error: {e}. Trying fallback...")
+                    continue
+
+        return (
+            "The AI service is currently experiencing extremely high demand across all free providers. "
+            "Please wait a few seconds and try asking your question again."
+        )
+
+    def stream_with_fallback(self, prompt: str, on_chunk) -> str:
+        """
+        Streams response with automatic failover if the primary model returns a 429 rate limit.
+        """
+        for model_name in self.models_pool:
+            assembled = []
+            try:
+                llm = ChatOpenAI(
+                    model=model_name,
+                    openai_api_key=self.openrouter_api_key,
+                    openai_api_base="https://openrouter.ai/api/v1",
+                    temperature=0.3,
+                    max_tokens=1024,
+                    default_headers={
+                        "HTTP-Referer": "http://localhost:8000",
+                        "X-Title": "AgriSearch Bot",
+                    },
+                )
+                stream_fn = getattr(llm, "stream", None)
+                if stream_fn:
+                    for chunk in stream_fn(prompt):
+                        text = getattr(chunk, "content", None) or (chunk.get("content") if isinstance(chunk, dict) else str(chunk))
+                        if text:
+                            assembled.append(text)
+                            on_chunk({"text": text, "done": False})
+                    res = "".join(assembled).strip()
+                    if res:
+                        return res
+                else:
+                    res_obj = llm.invoke(prompt)
+                    res_text = getattr(res_obj, "content", None) or str(res_obj)
+                    if res_text:
+                        on_chunk({"text": res_text, "done": False})
+                        return res_text.strip()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str or "temporarily" in err_str:
+                    print(f"Streaming: Model {model_name} rate-limited (429). Failing over...")
+                    continue
+                else:
+                    print(f"Streaming error on {model_name}: {e}. Trying fallback...")
+                    continue
+
+        fallback_msg = "The AI service is temporarily busy. Please retry in a few seconds."
+        on_chunk({"text": fallback_msg, "richContent": None, "sources": [], "done": True})
+        return fallback_msg
+
+    def _get_from_cache(self, query: str) -> Optional[dict]:
+        norm_key = self._normalize_key(query)
+        if norm_key in self._cache:
+            # Move to end for LRU order
+            self._cache.move_to_end(norm_key)
+            return self._cache[norm_key]
+        return None
+
+    def _save_to_cache(self, query: str, result: dict):
+        norm_key = self._normalize_key(query)
+        if len(self._cache) >= self._max_cache_size:
+            self._cache.popitem(last=False)  # Evict oldest
+        self._cache[norm_key] = result
+
     def process_query(self, query: str) -> dict:
         """
         Main query processing pipeline:
-        1. Retrieve relevant CSV data from vector store
-        2. Use Ollama to augment/refine response if needed
-        3. Format response with rich content
+        1. Fast LRU Cache check (instant)
+        2. Fast In-Memory QA & BM25 check (instant, < 1ms)
+        3. Single-pass Chroma Vector Search (retrieves docs & distances)
+        4. Confident Direct Vector Match check
+        5. LLM Synthesis using already-retrieved context
         """
-        
-        # Check cache first
-        if query in self._cache:
-            return self._cache[query]
+        # 1. Check LRU Cache
+        cached = self._get_from_cache(query)
+        if cached:
+            return cached
 
-        # Classify query
         query_type = self.classify_query_type(query)
 
-        # First, try to find a direct answer from our QA vectors (fast path)
-        direct_answer, direct_sources = self.find_direct_answer(query, k=3)
-        if direct_answer:
-            return {
-                "response": direct_answer,
-                "richContent": None,
-                "sources": direct_sources
+        # 2. Fast In-Memory exact & BM25 lookup
+        fast_ans, fast_sources = self.fast_lookup(query)
+        if fast_ans:
+            result = {
+                "response": fast_ans,
+                "richContent": self.format_rich_content(fast_ans, query_type, []),
+                "sources": fast_sources,
             }
+            self._save_to_cache(query, result)
+            return result
 
-        # If no vector-based direct answer was found, do a CSV-wide exact lookup
-        # across the local `files/` folder for an exact question match (case-insensitive).
-        csv_answer, csv_sources = self.csv_lookup_answer(query)
-        if csv_answer:
-            return {
-                "response": csv_answer,
-                "richContent": None,
-                "sources": csv_sources
+        # 3. Single-pass vector search
+        search_results = self.vector_search(query, k=3)
+
+        # 4. Direct answer from vector match (with fixed distance metric <= 0.35)
+        direct_ans, direct_sources = self.check_direct_answer(search_results, threshold_dist=0.35)
+        if direct_ans:
+            result = {
+                "response": direct_ans,
+                "richContent": self.format_rich_content(direct_ans, query_type, []),
+                "sources": direct_sources,
             }
+            self._save_to_cache(query, result)
+            return result
 
-        # Retrieve context from vector store for generative fallback
-        context_docs = self.retrieve_context(query) or []
-        
-        # Build prompt based on available context
-        if context_docs and len(context_docs) > 0:
-            # Use CSV data as primary source
-            # Limit number of docs and truncate their content to keep prompt small
-            docs_to_use = context_docs[:3]
-            context_text = "\n\n".join([
-                f"Source: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content[:self._max_ctx_chars]}"
-                for doc in docs_to_use
-            ])
-            
-            prompt = f"""You are AgriSearch Bot, an AI assistant specializing in agriculture and forestry intelligence.
+        # Extract documents from search results
+        context_docs = [doc for doc, _ in search_results]
+
+        # 5. Generative fallback via OpenRouter LLM
+        if context_docs:
+            context_blocks = []
+            for doc in context_docs[:3]:
+                clean_src = Path(doc.metadata.get("source", "Unknown")).name
+                context_blocks.append(f"Source: {clean_src}\n{doc.page_content[:self._max_ctx_chars]}")
+            context_text = "\n\n".join(context_blocks)
+
+            prompt = f"""You are AgriSearch Bot, an expert AI assistant specializing in agriculture and forestry intelligence.
 
 User Query: {query}
 
-Available Data from Agricultural Records:
+Available Agricultural Records:
 {context_text}
 
 Instructions:
-1. Answer the question primarily using the data provided above
-2. If the data contains relevant information, cite it specifically
-3. If the data is insufficient, you may supplement with general agricultural knowledge, but clearly indicate what comes from the data vs. general knowledge
-4. Keep responses concise, helpful, and farmer-friendly
-5. Use specific numbers, locations, and facts from the data when available
+1. Answer the query clearly using the data above.
+2. If data is relevant, cite specific numbers, crops, and facts.
+3. If data is insufficient, supplement with general agricultural knowledge while keeping advice practical and actionable.
+4. Keep answers concise, helpful, and farmer-friendly.
 
-Please provide a clear, helpful answer:"""
+Answer:"""
         else:
-            # No relevant CSV data found - use Ollama's knowledge
             if not self.is_agriculture_related(query):
                 return {
-                    "response": "I'm specifically designed to help with agriculture and forestry-related queries. Could you please ask a question related to crops, farming, soil, weather, forestry, or agricultural practices?",
+                    "response": (
+                        "I am specifically designed to assist with agriculture, crops, soil, "
+                        "weather, pest management, and forestry. Could you please ask a question "
+                        "related to farming or agriculture?"
+                    ),
                     "richContent": None,
-                    "sources": []
+                    "sources": [],
                 }
-            
-            prompt = f"""You are AgriSearch Bot, an AI assistant specializing in agriculture and forestry intelligence.
+
+            prompt = f"""You are AgriSearch Bot, an expert AI assistant specializing in agriculture and forestry intelligence.
 
 User Query: {query}
 
-Note: No specific data found in local records for this query.
-
 Instructions:
-1. Provide helpful agricultural/forestry information based on your knowledge
-2. Keep responses practical and farmer-friendly
-3. Focus on actionable advice
-4. Mention that this is general guidance and local conditions may vary
+1. Provide accurate, practical agricultural guidance.
+2. Keep responses actionable and farmer-friendly.
+3. Mention that local conditions may vary.
 
-Please provide a clear, helpful answer:"""
-        
-        # Get response from Ollama
-        try:
-            result = self.llm.invoke(prompt)
-            # Ollama client may return a dict-like or object; attempt to grab text safely
-            response_text = getattr(result, 'content', None) or result.get('content') if isinstance(result, dict) else str(result)
-        except Exception as e:
-            response_text = f"I apologize, but I encountered an error processing your query: {str(e)}"
-        
-        # Format rich content
+Answer:"""
+
+        response_text = self.generate_with_fallback(prompt)
+
+        # Deduplicate sources and clean source paths
+        seen_sources = set()
+        sources = []
+        for doc in context_docs[:3]:
+            raw_src = doc.metadata.get("source", "Unknown")
+            clean_src = Path(raw_src).name
+            if clean_src not in seen_sources:
+                seen_sources.add(clean_src)
+                excerpt = doc.page_content[:180] + ("..." if len(doc.page_content) > 180 else "")
+                sources.append({"source": clean_src, "excerpt": excerpt})
+
         rich_content = self.format_rich_content(response_text, query_type, context_docs)
-        
-        # Extract sources
-        sources = [
-            {
-                "source": doc.metadata.get('source', 'Unknown'),
-                "excerpt": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
-            }
-            for doc in context_docs[:3]  # Limit to top 3 sources
-        ]
-        
+
         out = {
             "response": response_text,
             "richContent": rich_content,
-            "sources": sources
+            "sources": sources,
         }
-
-        # Cache the result (simple in-memory cache)
-        try:
-            self._cache[query] = out
-        except Exception:
-            pass
-
+        self._save_to_cache(query, out)
         return out
 
     def process_query_stream(self, query: str, on_chunk, k: int = 3):
         """
-        Stream the response for `query` by calling `on_chunk(chunk)` for each partial piece.
-
-        `on_chunk` will be invoked with a dict containing at least:
-          - 'text': partial text (may be a line or fragment)
-          - 'done': bool (True for final chunk)
-        Final chunk will also include 'richContent' and 'sources'.
-
-        If the LLM client provides a streaming API, it will be used. Otherwise the full
-        response is generated and then split into lines and streamed.
+        Streaming response generator:
+        Calls on_chunk({'text': ..., 'done': bool, 'richContent': ..., 'sources': ...})
         """
-        # Return cached result immediately if available
-        if hasattr(self, '_cache') and query in self._cache:
-            cached = self._cache[query]
+        # 1. Fast Cache check
+        cached = self._get_from_cache(query)
+        if cached:
             on_chunk({
-                'text': cached['response'],
-                'richContent': cached.get('richContent'),
-                'sources': cached.get('sources', []),
-                'done': True
+                "text": cached["response"],
+                "richContent": cached.get("richContent"),
+                "sources": cached.get("sources", []),
+                "done": True,
             })
             return
 
-        # Fast-path direct/csv answers
-        direct_answer, direct_sources = self.find_direct_answer(query, k=k)
-        if direct_answer:
-            out = {"response": direct_answer, "richContent": None, "sources": direct_sources}
-            try:
-                self._cache[query] = out
-            except Exception:
-                pass
-            on_chunk({'text': direct_answer, 'richContent': None, 'sources': direct_sources, 'done': True})
+        query_type = self.classify_query_type(query)
+
+        # 2. Fast In-Memory lookup
+        fast_ans, fast_sources = self.fast_lookup(query)
+        if fast_ans:
+            rich_content = self.format_rich_content(fast_ans, query_type, [])
+            out = {"response": fast_ans, "richContent": rich_content, "sources": fast_sources}
+            self._save_to_cache(query, out)
+            on_chunk({"text": fast_ans, "richContent": rich_content, "sources": fast_sources, "done": True})
             return
 
-        csv_answer, csv_sources = self.csv_lookup_answer(query)
-        if csv_answer:
-            out = {"response": csv_answer, "richContent": None, "sources": csv_sources}
-            try:
-                self._cache[query] = out
-            except Exception:
-                pass
-            on_chunk({'text': csv_answer, 'richContent': None, 'sources': csv_sources, 'done': True})
+        # 3. Vector search
+        search_results = self.vector_search(query, k=k)
+
+        # 4. Confident vector match
+        direct_ans, direct_sources = self.check_direct_answer(search_results, threshold_dist=0.35)
+        if direct_ans:
+            rich_content = self.format_rich_content(direct_ans, query_type, [])
+            out = {"response": direct_ans, "richContent": rich_content, "sources": direct_sources}
+            self._save_to_cache(query, out)
+            on_chunk({"text": direct_ans, "richContent": rich_content, "sources": direct_sources, "done": True})
             return
 
-        # Retrieve context and build prompt (same logic as process_query)
-        context_docs = self.retrieve_context(query) or []
-        if context_docs and len(context_docs) > 0:
-            docs_to_use = context_docs[:3]
-            context_text = "\n\n".join([
-                f"Source: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content[:self._max_ctx_chars]}"
-                for doc in docs_to_use
-            ])
-            prompt = f"""You are AgriSearch Bot, an AI assistant specializing in agriculture and forestry intelligence.
+        context_docs = [doc for doc, _ in search_results]
+
+        # 5. Build prompt
+        if context_docs:
+            context_blocks = [
+                f"Source: {Path(doc.metadata.get('source', 'Unknown')).name}\n{doc.page_content[:self._max_ctx_chars]}"
+                for doc in context_docs[:3]
+            ]
+            prompt = f"""You are AgriSearch Bot, an expert AI assistant specializing in agriculture and forestry intelligence.
 
 User Query: {query}
 
-Available Data from Agricultural Records:
-{context_text}
+Available Agricultural Records:
+{chr(10).join(context_blocks)}
 
 Instructions:
-1. Answer the question primarily using the data provided above
-2. If the data contains relevant information, cite it specifically
-3. If the data is insufficient, you may supplement with general agricultural knowledge, but clearly indicate what comes from the data vs. general knowledge
-4. Keep responses concise, helpful, and farmer-friendly
-5. Use specific numbers, locations, and facts from the data when available
+1. Answer the query clearly using the data above.
+2. If data is relevant, cite specific numbers, crops, and facts.
+3. Keep answers concise, practical, and farmer-friendly.
 
-Please provide a clear, helpful answer:"""
+Answer:"""
         else:
             if not self.is_agriculture_related(query):
                 on_chunk({
-                    'text': "I'm specifically designed to help with agriculture and forestry-related queries. Could you please ask a question related to crops, farming, soil, weather, forestry, or agricultural practices?",
-                    'richContent': None,
-                    'sources': [],
-                    'done': True
+                    "text": (
+                        "I am specifically designed to assist with agriculture, crops, soil, "
+                        "weather, pest management, and forestry. Could you please ask a question "
+                        "related to farming or agriculture?"
+                    ),
+                    "richContent": None,
+                    "sources": [],
+                    "done": True,
                 })
                 return
 
-            prompt = f"""You are AgriSearch Bot, an AI assistant specializing in agriculture and forestry intelligence.
+            prompt = f"""You are AgriSearch Bot, an expert AI assistant specializing in agriculture and forestry intelligence.
 
 User Query: {query}
 
-Note: No specific data found in local records for this query.
-
 Instructions:
-1. Provide helpful agricultural/forestry information based on your knowledge
-2. Keep responses practical and farmer-friendly
-3. Focus on actionable advice
-4. Mention that this is general guidance and local conditions may vary
+1. Provide accurate, practical agricultural guidance.
+2. Keep responses actionable and farmer-friendly.
 
-Please provide a clear, helpful answer:"""
+Answer:"""
 
-        # Attempt to stream from the LLM if it supports streaming
-        assembled = []
-        try:
-            stream_fn = None
-            if hasattr(self.llm, 'stream'):
-                stream_fn = getattr(self.llm, 'stream')
-            elif hasattr(self.llm, 'invoke_stream'):
-                stream_fn = getattr(self.llm, 'invoke_stream')
+        final_text = self.stream_with_fallback(prompt, on_chunk)
+        seen_sources = set()
+        sources = []
+        for doc in context_docs[:3]:
+            clean_src = Path(doc.metadata.get("source", "Unknown")).name
+            if clean_src not in seen_sources:
+                seen_sources.add(clean_src)
+                sources.append({
+                    "source": clean_src,
+                    "excerpt": doc.page_content[:180] + ("..." if len(doc.page_content) > 180 else ""),
+                })
 
-            if stream_fn is not None:
-                for chunk in stream_fn(prompt):
-                    # Each chunk may be a dict-like or string/object
-                    text = None
-                    try:
-                        text = getattr(chunk, 'content', None) or (chunk.get('content') if isinstance(chunk, dict) else None)
-                    except Exception:
-                        text = None
-                    if text is None:
-                        try:
-                            text = str(chunk)
-                        except Exception:
-                            text = ''
-                    if text:
-                        assembled.append(text)
-                        on_chunk({'text': text, 'done': False})
-            else:
-                # Fallback: generate full response then stream by lines
-                result = self.llm.invoke(prompt)
-                result_text = getattr(result, 'content', None) or (result.get('content') if isinstance(result, dict) else str(result))
-                for line in result_text.splitlines():
-                    assembled.append(line + "\n")
-                    on_chunk({'text': line, 'done': False})
-
-        except Exception as e:
-            on_chunk({'text': f"I apologize, but I encountered an error processing your query: {str(e)}", 'done': True})
-            return
-
-        # Finalize: join assembled text and send final chunk with metadata
-        final_text = ''.join(assembled).strip()
-        query_type = self.classify_query_type(query)
         rich_content = self.format_rich_content(final_text, query_type, context_docs)
-        sources = [
-            {
-                'source': doc.metadata.get('source', 'Unknown'),
-                'excerpt': doc.page_content[:200] + ('...' if len(doc.page_content) > 200 else '')
-            }
-            for doc in (context_docs or [])[:3]
-        ]
-
-        out = {
-            'response': final_text,
-            'richContent': rich_content,
-            'sources': sources
-        }
-        try:
-            self._cache[query] = out
-        except Exception:
-            pass
-
-        on_chunk({'text': final_text, 'richContent': rich_content, 'sources': sources, 'done': True})
+        out = {"response": final_text, "richContent": rich_content, "sources": sources}
+        self._save_to_cache(query, out)
+        on_chunk({"text": final_text, "richContent": rich_content, "sources": sources, "done": True})
 
 
-# For testing
 if __name__ == "__main__":
     rag = AgriRAGSystem()
-    
     test_queries = [
- 
-        "what is soil?"
+        "what is soil?",
+        "what is irrigation?",
+        "what is fertilizer?",
     ]
-    
-    for query in test_queries:
-        print(f"\n{'='*80}")
-        print(f"Query: {query}")
-        print(f"{'='*80}")
-        
-        result = rag.process_query(query)
-        
-        print(f"\nResponse:\n{result['response']}")
-        
-        if result['richContent']:
-            print(f"\nRich Content: {json.dumps(result['richContent'], indent=2)}")
-        
-        if result['sources']:
-            print(f"\nSources ({len(result['sources'])}):")
-            for i, source in enumerate(result['sources'], 1):
-                print(f"{i}. {source['source']}")
-        print()
+    for q in test_queries:
+        print(f"\n{'='*60}\nQuery: {q}\n{'='*60}")
+        res = rag.process_query(q)
+        print(f"Response: {res['response']}")
+        print(f"Sources: {res['sources']}")
+        print(f"RichContent: {res['richContent']}")

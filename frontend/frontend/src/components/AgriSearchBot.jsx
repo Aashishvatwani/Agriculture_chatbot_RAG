@@ -5,6 +5,9 @@ import BotMascot from './BotMascot';
 import FeaturePanel from './FeaturePanel';
 import VoiceInput from './VoiceInput';
 import ImageFeatures from './ImageFeatures';
+import CartoonBackground from './CartoonBackground';
+import CartoonCompanions from './CartoonCompanions';
+import { BotCartoonAvatar } from './CartoonAvatar';
 
 function AgriSearchBot() {
   const [messages, setMessages] = useState(() => {
@@ -26,6 +29,7 @@ function AgriSearchBot() {
   const [isTyping, setIsTyping] = useState(false);
   const [showBot, setShowBot] = useState(false);
   const [showFeatures, setShowFeatures] = useState(true);
+  const [showCompanions, setShowCompanions] = useState(true);
   const messagesEndRef = useRef(null);
   const chatContainerRef = useRef(null);
 
@@ -179,7 +183,8 @@ function AgriSearchBot() {
 
   return (
     <div className={`agrisearch-container ${showBot ? 'show' : ''}`}>
-      {/* Animated Background */}
+      {/* Animated Cartoon Background with Sun, Tractor, Spud, and Worm */}
+      <CartoonBackground />
       <div className="animated-background">
         <div className="floating-leaf leaf-1"></div>
         <div className="floating-leaf leaf-2"></div>
@@ -195,10 +200,17 @@ function AgriSearchBot() {
         <div className="chat-header">
           <BotMascot isTyping={isTyping} />
           <div className="header-content">
-            <h1 className="bot-title">AgriSearch Bot</h1>
+            <h1 className="bot-title">AgriSearch Bot 🌿</h1>
             <p className="bot-subtitle">AI-Powered Agriculture & Forestry Intelligence</p>
           </div>
           <div className="header-actions">
+            <button 
+              className={`icon-btn farm-crew-btn ${showCompanions ? 'active' : ''}`}
+              onClick={() => setShowCompanions(!showCompanions)}
+              title={showCompanions ? "Hide Farm Crew Friends" : "Show Animated Farm Crew Friends!"}
+            >
+              <span className="crew-btn-emoji">🌽</span>
+            </button>
             <button className="icon-btn" title="Settings">
               <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
                 <path d="M10 12.5C11.3807 12.5 12.5 11.3807 12.5 10C12.5 8.61929 11.3807 7.5 10 7.5C8.61929 7.5 7.5 8.61929 7.5 10C7.5 11.3807 8.61929 12.5 10 12.5Z" stroke="currentColor" strokeWidth="1.5"/>
@@ -210,7 +222,12 @@ function AgriSearchBot() {
 
         {/* Messages Area */}
         <div className="messages-container" ref={chatContainerRef}>
-          {/* Feature Panel Overlay */}
+          {/* Animated Farm Crew Companions Bar */}
+          {showCompanions && (
+            <CartoonCompanions onSelectQuery={handleFeatureSelect} />
+          )}
+
+          {/* Feature Panel Overlay on Welcome */}
           {showFeatures && messages.length === 1 && (
             <FeaturePanel onFeatureSelect={handleFeatureSelect} />
           )}
@@ -219,14 +236,15 @@ function AgriSearchBot() {
             <ChatMessage key={message.id} message={message} />
           ))}
           {isTyping && (
-            <div className="typing-indicator">
-              <div className="bot-avatar-small">
-                <div className="leaf-icon">🍃</div>
-              </div>
-              <div className="typing-dots">
-                <span></span>
-                <span></span>
-                <span></span>
+            <div className="typing-indicator cartoon-typing-indicator">
+              <BotCartoonAvatar isTyping={true} />
+              <div className="typing-status-wrapper">
+                <span className="typing-funny-text">🚜 Farm Crew is digging up wisdom...</span>
+                <div className="typing-dots">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
               </div>
             </div>
           )}

@@ -1,6 +1,7 @@
 import './ChatMessage.css';
 import RichContent from './RichContent';
 import { useEffect, useState } from 'react';
+import { BotCartoonAvatar, UserCartoonAvatar } from './CartoonAvatar';
 
 function ChatMessage({ message }) {
   const { type, content, richContent, timestamp, streaming, streamedChunks, sources, image } = message;
@@ -456,9 +457,7 @@ function ChatMessage({ message }) {
   return (
     <div className={`message-wrapper ${type}`}>
       {type === 'bot' && (
-        <div className="message-avatar">
-          <div className="avatar-leaf">🍃</div>
-        </div>
+        <BotCartoonAvatar />
       )}
       
       <div className="message-content">
@@ -499,9 +498,7 @@ function ChatMessage({ message }) {
       </div>
 
       {type === 'user' && (
-        <div className="message-avatar user-avatar">
-          <div className="avatar-icon">👤</div>
-        </div>
+        <UserCartoonAvatar />
       )}
     </div>
   );
